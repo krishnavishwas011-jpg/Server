@@ -21,9 +21,10 @@ class Rules:
     def size(n):   return 'B' if n >= 5 else 'S'
     @staticmethod
     def color(n):
-        if n in [1,3,5,7,9]: return 'G'
+        if n in [0, 5]:      return 'V'
+        if n in [1,3,7,9]:   return 'G'
         if n in [2,4,6,8]:   return 'R'
-        return 'V'  # 0 and 5 are violet (5 counts green too)
+        return 'R'
     @staticmethod
     def color_wins(pred, n):
         # violet counts as both R and G
@@ -76,205 +77,106 @@ class DB:
     def status(self): return f"DB:OK({self.writes})" if self.ok else "DB:OFF"
 
 # ══════════════════════════════════════════════════════════════════════
-# CYCLE DETECTOR  — learns patterns like BBSBBSSS or RRGGRRRG live
+# STATISTICAL ANALYZER — frequency + transition + recent momentum
 # ══════════════════════════════════════════════════════════════════════
-class CycleDetector:
-    """
-    Scans history for repeating sub-sequences.
-    Tries cycle lengths 2..8.
-    Picks the cycle with highest recent match rate.
-    After every result it re-evaluates — fully live.
-    """
-    MIN_LEN = 2
-    MAX_LEN = 8
-    LOOK_BACK = 40   # how many recent values to score cycles on
+class StatisticalAnalyzer:
+    def __init__(self, ptype):
+        self.ptype = ptype
+        self.nhist = deque(maxlen=1200)
+        self.hist = deque(maxlen=1200)
 
-    def __init__(self):
-        self.hist = deque(maxlen=500)   # e.g. 'B','S','B',...
-
-    def push(self, val):
-        self.hist.appendleft(val)   # newest at index 0
-
-    def _score_cycle(self, seq, h):
-        """How well does repeating `seq` predict values in h (newest first)?"""
-        n = len(seq)
-        hits = 0
-        total = 0
-        for i in range(len(h) - 1):
-            pos_in_cycle = i % n
-            pred = seq[pos_in_cycle]
-            actual = h[i]
-            if pred == actual:
-                hits += 1
-            total += 1
-        return hits / total if total else 0
-
-    def best_cycle(self):
-        h = list(self.hist)
-        if len(h) < 10:
-            return None, 0, 0
-
-        lb = h[:self.LOOK_BACK]
-        best_seq   = None
-        best_score = 0
-        best_len   = 0
-
-        for length in range(self.MIN_LEN, self.MAX_LEN + 1):
-            if len(h) < length * 3:
-                continue
-            # Candidate: the most recent `length` values reversed (oldest first = cycle template)
-            # We try the cycle as it appears oldest-first
-            candidate = list(reversed(h[:length]))
-            score = self._score_cycle(candidate, lb)
-            if score > best_score:
-                best_score = score
-                best_seq   = candidate
-                best_len   = length
-
-        return best_seq, best_score, best_len
-
-    def predict(self):
-        """
-        Returns (next_val, confidence, cycle_str, score)
-        next_val: 'B'/'S' or 'G'/'R'/'V'
-        """
-        h = list(self.hist)
-        if len(h) < 8:
-            return None, 0, '', 0
-
-        seq, score, length = self.best_cycle()
-        if seq is None or score < 0.55:
-            return None, 0, '', score
-
-        # Current position in cycle = index 0 in hist corresponds to position 0
-        # hist[0] = just played, hist[1] = before that, etc.
-        # Position in cycle for the NEXT value:
-        # hist[0] was at position (length-1) if cycle aligns perfectly,
-        # but we detect actual position by finding best alignment offset
-        best_offset = 0
-        best_align  = -1
-        for offset in range(length):
-            hits = 0
-            for i in range(min(len(h), self.LOOK_BACK)):
-                expected = seq[(i + offset) % length]
-                if expected == h[i]:
-                    hits += 1
-            if hits > best_align:
-                best_align  = hits
-                best_offset = offset
-
-        next_pos  = (best_offset - 1) % length   # one step ahead of current
-        next_val  = seq[next_pos]
-        conf      = int(score * 100)
-        cycle_str = ''.join(seq)
-
-        return next_val, conf, cycle_str, score
-
-# ══════════════════════════════════════════════════════════════════════
-# SIMPLE STREAK / MAJORITY  (fallback when no cycle)
-# ══════════════════════════════════════════════════════════════════════
-class SimpleAnalyzer:
-    def __init__(self):
-        self.hist = deque(maxlen=500)
-
-    def push(self, val):
+    def push(self, number):
+        self.nhist.appendleft(number)
+        val = Rules.size(number) if self.ptype == 'size' else Rules.color(number)
         self.hist.appendleft(val)
 
-    def predict(self):
+    def analyze(self):
+        if len(self.hist) < 10:
+            default = 'B' if self.ptype == 'size' else 'G'
+            return default, 50, "loading stats"
+
         h = list(self.hist)
-        if len(h) < 4:
-            return None, 0, ''
+        n = list(self.nhist)
 
-        # Streak length from front
-        sl = 1
+        # global frequency
+        freq = {}
+        for x in h:
+            freq[x] = freq.get(x, 0) + 1
+        total = len(h)
+        p_freq = {k: v / total for k, v in freq.items()}
+
+        # recent weighted frequency (newest gets higher weight)
+        wsum = {}
+        tsum = 0.0
+        for i, x in enumerate(h[:80]):
+            w = 1.0 / (1.0 + i / 8.0)
+            wsum[x] = wsum.get(x, 0.0) + w
+            tsum += w
+        p_recent = {k: (wsum.get(k, 0.0) / tsum if tsum else 0.0)
+                    for k in set(h)}
+
+        # first-order transition P(next | current)
+        cur = h[0]
+        tcnt = {}
+        rows = 0
         for i in range(1, len(h)):
-            if h[i] == h[0]: sl += 1
-            else: break
+            if h[i] == cur:
+                nxt = h[i - 1]
+                tcnt[nxt] = tcnt.get(nxt, 0) + 1
+                rows += 1
+        p_trans = {k: (tcnt.get(k, 0) / rows if rows else 0.0)
+                   for k in set(h)}
 
-        # After long streak (>=5), expect flip
-        if sl >= 5:
-            opp = self._opp(h[0])
-            return opp, min(82, 65 + sl * 2), f"FLIP after {sl}x{h[0]}"
+        # number-level signal (for color predictor)
+        p_num = {}
+        if self.ptype == 'color' and n:
+            nfreq = {}
+            for x in n[:120]:
+                c = Rules.color(x)
+                nfreq[c] = nfreq.get(c, 0) + 1
+            nt = sum(nfreq.values())
+            p_num = {k: (nfreq.get(k, 0) / nt if nt else 0.0) for k in ['G', 'R', 'V']}
 
-        # AABB: h[0]==h[1] != h[2]==h[3] → next = h[2]
-        if len(h) >= 4 and h[0]==h[1] and h[2]==h[3] and h[0]!=h[2]:
-            return h[2], 78, f"AABB→{h[2]}"
+        candidates = ['B', 'S'] if self.ptype == 'size' else ['G', 'R', 'V']
+        score = {}
+        for c in candidates:
+            s = 0.45 * p_freq.get(c, 0.0) + 0.35 * p_recent.get(c, 0.0) + 0.20 * p_trans.get(c, 0.0)
+            if p_num:
+                s = 0.80 * s + 0.20 * p_num.get(c, 0.0)
+            score[c] = s
 
-        # AAABBB
-        if len(h) >= 6 and h[0]==h[1]==h[2] and h[3]==h[4]==h[5] and h[0]!=h[3]:
-            return h[0], 80, f"AAABBB cont {h[0]}"
+        best = max(score, key=score.get)
+        ordered = sorted(score.items(), key=lambda kv: kv[1], reverse=True)
+        gap = ordered[0][1] - (ordered[1][1] if len(ordered) > 1 else 0.0)
+        conf = int(max(52, min(90, (ordered[0][1] * 100) + gap * 120)))
 
-        # ABAB alternating
-        if len(h) >= 4 and h[0]!=h[1] and h[0]==h[2] and h[1]==h[3]:
-            return self._opp(h[0]), 76, f"ABAB→{self._opp(h[0])}"
+        reason = (
+            f"deep stats | freq={p_freq.get(best,0):.2f} "
+            f"recent={p_recent.get(best,0):.2f} trans={p_trans.get(best,0):.2f}"
+        )
+        if p_num:
+            reason += f" num={p_num.get(best,0):.2f}"
+        return best, conf, reason
 
-        # Majority last 6
-        last6 = h[:6]
-        cnt = {}
-        for x in last6: cnt[x] = cnt.get(x,0)+1
-        dom = max(cnt, key=cnt.get)
-        if cnt[dom] >= 4:
-            return dom, 70, f"MAJ {cnt[dom]}/6 {dom}"
-
-        return None, 0, ''
-
-    @staticmethod
-    def _opp(v):
-        return {'B':'S','S':'B','G':'R','R':'G','V':'G'}.get(v, v)
-
-# ══════════════════════════════════════════════════════════════════════
-# ADAPTIVE SCORER  — tracks per-method accuracy live
-# ══════════════════════════════════════════════════════════════════════
-class AdaptiveScorer:
-    def __init__(self):
-        # method → [wins, total]
-        self.rec = {'cycle':[0,0], 'simple':[0,0], 'flip':[0,0]}
-
-    def hit(self, method):
-        m = self._key(method)
-        self.rec[m][0] += 1
-        self.rec[m][1] += 1
-
-    def miss(self, method):
-        m = self._key(method)
-        self.rec[m][1] += 1
-
-    def wr(self, method):
-        m = self._key(method)
-        t = self.rec[m][1]
-        return round(self.rec[m][0]/t*100, 0) if t else 50.0
-
-    def _key(self, method):
-        for k in self.rec:
-            if k in method: return k
-        return 'simple'
-
-    def display(self):
-        return "  ".join([f"{m}:{self.rec[m][0]}/{self.rec[m][1]}({self.wr(m):.0f}%)"
-                          for m in self.rec])
 
 # ══════════════════════════════════════════════════════════════════════
-# MASTER PREDICTOR  — ties everything together, self-updates live
+# MASTER PREDICTOR  — purely statistical deep-analysis predictor
 # ══════════════════════════════════════════════════════════════════════
 class Predictor:
     def __init__(self, ptype):
-        self.ptype   = ptype           # 'size' or 'color'
-        self.cycle   = CycleDetector()
-        self.simple  = SimpleAnalyzer()
-        self.scorer  = AdaptiveScorer()
+        self.ptype   = ptype
+        self.stats   = StatisticalAnalyzer(ptype)
         self.seen    = set()
         self.total   = 0
-        self.consec_loss = 0
-        self.flip_active = False
         self.recent  = deque(maxlen=30)
+        self.wins = 0
+        self.loss = 0
 
     # ── ingest ───────────────────────────────────────────────────────
     def ingest(self, number, period=None):
         if period and period in self.seen: return False
         if period: self.seen.add(period)
-        val = Rules.size(number) if self.ptype=='size' else Rules.color(number)
-        self.cycle.push(val)
-        self.simple.push(val)
+        self.stats.push(number)
         self.total += 1
         return True
 
@@ -286,14 +188,9 @@ class Predictor:
     def feedback(self, is_win, method):
         self.recent.append(1 if is_win else 0)
         if is_win:
-            self.scorer.hit(method)
-            self.consec_loss = 0
-            self.flip_active = False
+            self.wins += 1
         else:
-            self.scorer.miss(method)
-            self.consec_loss += 1
-            if self.consec_loss >= 3:
-                self.flip_active = True
+            self.loss += 1
 
     def winrate(self):
         r = list(self.recent)
@@ -301,39 +198,12 @@ class Predictor:
 
     # ── predict ──────────────────────────────────────────────────────
     def predict(self):
-        if self.total < 8:
+        if self.total < 10:
             val = 'B' if self.ptype=='size' else 'G'
-            return self._pack(val, 50, 'loading', f'Loading {self.total}/8')
+            return self._pack(val, 50, 'loading', f'loading {self.total}/10')
 
-        # Try cycle first
-        cv, cc, cstr, cscore = self.cycle.predict()
-        if cv and cc >= 58:
-            method = 'cycle'
-            val, conf = cv, cc
-            reason = f"Cycle [{cstr}] score={cscore:.0f}%"
-        else:
-            # Fallback to simple
-            sv, sc, sreason = self.simple.predict()
-            if sv and sc >= 60:
-                method = 'simple'
-                val, conf = sv, sc
-                reason = sreason
-            else:
-                # Last resort: follow current cycle value or majority
-                h = list(self.cycle.hist)
-                val = h[0] if h else ('B' if self.ptype=='size' else 'G')
-                conf = 55
-                method = 'follow'
-                reason = f"Following {val}"
-
-        # FLIP: after 3 straight losses, invert
-        if self.flip_active:
-            val    = self._opp(val)
-            conf   = min(conf + 8, 92)
-            method = 'flip_' + method
-            reason = f"[FLIP/{self.consec_loss}L] {reason}"
-
-        return self._pack(val, conf, method, reason)
+        val, conf, reason = self.stats.analyze()
+        return self._pack(val, conf, 'deep_stats', reason)
 
     def _pack(self, raw, conf, method, reason):
         if self.ptype == 'size':
@@ -601,9 +471,9 @@ class Server:
         n30 = 30-sec if sec<30 else 60-sec
         n1m = 60-sec
 
-        print(f"\n  ULTRA AI v11  |  {now.strftime('%H:%M:%S')}  "
+        print(f"\n  ULTRA AI v12  |  {now.strftime('%H:%M:%S')}  "
               f"|  30s:{n30:>2}s  |  1m:{n1m:>2}s  |  {self.db.status()}")
-        print(f"  CYCLE DETECTION + LIVE SELF-LEARNING | NO SKIP\n")
+        print(f"  DEEP STATISTICAL ANALYSIS + LIVE SELF-LEARNING | NO SKIP\n")
 
         for game in ['30s','1m']:
             g   = self.g[game]
@@ -614,7 +484,7 @@ class Server:
             print(f"  {'30 SECOND' if game=='30s' else '1 MINUTE'} MARKET"
                   f"  |  {self.dark.total} periods loaded")
 
-            # Last 30 values for visual cycle check
+            # Last 30 values for visual analysis
             h30 = g['hist'][:30]
             if h30:
                 sz = ''.join(['B' if x['size']=='big' else 'S' for x in h30])
@@ -624,32 +494,25 @@ class Server:
                 print(f"  SIZE  (newest→) : {sz}")
                 print(f"  COLOR (newest→) : {cl}")
 
-            # Cycle detector state
-            cv,cc,cstr,cscore = self.dark.cycle.predict() if True else (None,0,'',0)
-            sv,sc,cstr2,cscore2 = self.fox.cycle.predict()
-            print(f"  COLOR cycle: [{cstr}] score={cscore:.0f}%   "
-                  f"SIZE cycle: [{cstr2}] score={cscore2:.0f}%")
-
-            # Accuracy
-            print(f"  DARK accuracy: {self.dark.scorer.display()}")
-            print(f"  FOX  accuracy: {self.fox.scorer.display()}")
+            print(f"  DARK recent WR(30): {self.dark.winrate()}%  "
+                  f"total W:{self.dark.wins} L:{self.dark.loss}")
+            print(f"  FOX  recent WR(30): {self.fox.winrate()}%  "
+                  f"total W:{self.fox.wins} L:{self.fox.loss}")
 
             print(f"  {'─'*70}")
 
             # DARK block
-            fl = "  [FLIP]" if self.dark.flip_active else ""
             print(f"  DARK [COLOR]  WR:{dkt.wr()}%  "
                   f"W:{dkt.wins} L:{dkt.losses}  "
-                  f"Wstr:{dkt.wstrk} Lstr:{dkt.lstrk}{fl}")
+                  f"Wstr:{dkt.wstrk} Lstr:{dkt.lstrk}")
             self._pred_line(dkt.last, g['dkp'], g['dkt'], 'color')
 
             print()
 
             # FOX block
-            fl2 = "  [FLIP]" if self.fox.flip_active else ""
             print(f"  FOX  [SIZE]   WR:{fxt.wr()}%  "
                   f"W:{fxt.wins} L:{fxt.losses}  "
-                  f"Wstr:{fxt.wstrk} Lstr:{fxt.lstrk}{fl2}")
+                  f"Wstr:{fxt.wstrk} Lstr:{fxt.lstrk}")
             self._pred_line(fxt.last, g['fxp'], g['fxt'], 'size')
 
             print()
@@ -705,11 +568,11 @@ class Server:
     def start(self):
         os.system('cls' if os.name=='nt' else 'clear')
         print("""
-  ULTRA AI v11  —  STARTING
+  ULTRA AI v12  —  STARTING
   ─────────────────────────────────────────────────────────
-  Cycle detection: learns BBSBBSSS / RRGGRRRG patterns live
-  After every result: cycle re-scored, weights updated
-  Flip mode: 3 straight losses → prediction inverts
+  Deep analysis: frequency + recency + transition statistics
+  Color rules: 1,3,7,9=GREEN | 2,4,6,8=RED | 0=RED+VIOLET | 5=GREEN+VIOLET
+  After every result: statistical weights update live
   No skip: every period gets a prediction
   ─────────────────────────────────────────────────────────
         """)
