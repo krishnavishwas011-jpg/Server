@@ -1,8 +1,18 @@
 
 import json, time, threading, os, math, sys, requests
+import numpy as np
 from collections import defaultdict, Counter, deque
 from datetime import datetime
 from pathlib import Path
+
+
+# Optional ML stack
+try:
+    from sklearn.linear_model import LogisticRegression
+    SKLEARN_OK = True
+except Exception:
+    LogisticRegression = None
+    SKLEARN_OK = False
 
 # ─────────────────────── GAME CONSTANTS ───────────────────────
 SIZE  = {0:'S',1:'S',2:'S',3:'S',4:'S',5:'B',6:'B',7:'B',8:'B',9:'B'}
@@ -287,7 +297,8 @@ class ConsensusEngine:
         'regime':    0.25,
         'pattern':   0.20,
         'streak':    0.15,
-        'frequency': 0.10,
+        'frequency': 0.08,
+        'ml':        0.22,
     }
     
     def __init__(self):
@@ -460,6 +471,69 @@ class NumberPredictor:
 
 
 # ══════════════════════════════════════════════════════════
+# SIGNAL 6: ML SEQUENCE CLASSIFIER (NumPy + scikit-learn)
+# Uses lag features + streak features for next SIZE prediction.
+# ══════════════════════════════════════════════════════════
+class MLSequencePredictor:
+    def __init__(self, lookback=8):
+        self.lookback = lookback
+        self.model = None
+
+    def _featurize(self, sizes):
+        vals = np.array([1 if s == 'B' else 0 for s in sizes], dtype=np.int8)
+        X, y = [], []
+        lb = self.lookback
+        for i in range(lb, len(vals)-1):
+            hist = vals[i-lb:i]
+            last = hist[-1]
+            streak = 1
+            for v in hist[-2::-1]:
+                if v == last:
+                    streak += 1
+                else:
+                    break
+            alt_rate = float(np.mean(hist[1:] != hist[:-1])) if lb > 1 else 0.0
+            feat = np.concatenate([hist, np.array([hist.mean(), streak, alt_rate], dtype=np.float32)])
+            X.append(feat)
+            y.append(vals[i])
+        if not X:
+            return None, None
+        return np.vstack(X), np.array(y)
+
+    def train(self, sizes, window=220):
+        if not SKLEARN_OK or len(sizes) < (self.lookback + 20):
+            self.model = None
+            return False
+        seq = list(sizes[:window])[::-1]
+        X, y = self._featurize(seq)
+        if X is None or len(np.unique(y)) < 2:
+            self.model = None
+            return False
+        m = LogisticRegression(max_iter=350, solver='lbfgs', class_weight='balanced')
+        m.fit(X, y)
+        self.model = m
+        return True
+
+    def predict(self, sizes):
+        if self.model is None or len(sizes) < self.lookback:
+            return {'best': None, 'confidence': 0.0}
+        hist = np.array([1 if s == 'B' else 0 for s in sizes[:self.lookback]][::-1], dtype=np.int8)
+        last = hist[-1]
+        streak = 1
+        for v in hist[-2::-1]:
+            if v == last:
+                streak += 1
+            else:
+                break
+        alt_rate = float(np.mean(hist[1:] != hist[:-1])) if self.lookback > 1 else 0.0
+        feat = np.concatenate([hist, np.array([hist.mean(), streak, alt_rate], dtype=np.float32)]).reshape(1, -1)
+        p_big = float(self.model.predict_proba(feat)[0][1])
+        best = 'B' if p_big >= 0.5 else 'S'
+        conf = 0.50 + min(abs(p_big - 0.5) * 1.3, 0.30)
+        return {'best': best, 'confidence': conf, 'p_big': round(p_big, 3)}
+
+
+# ══════════════════════════════════════════════════════════
 # DATA STORE
 # ══════════════════════════════════════════════════════════
 class DataStore:
@@ -513,6 +587,7 @@ class ProphetUltra:
         self.streak   = StreakBreakDetector()
         self.freq_rev = FrequencyReversion()
         self.num_pred = NumberPredictor()
+        self.ml_seq   = MLSequencePredictor(lookback=8)
         self.consensus= ConsensusEngine()
     
     def predict(self):
@@ -523,8 +598,9 @@ class ProphetUltra:
         if len(nums) < 8:
             return self._default()
         
-        # Train number predictor
+        # Train predictors
         self.num_pred.train(nums)
+        self.ml_seq.train(sizes)
         
         # ─── SIZE SIGNALS ───
         m_probs, m_best, m_margin = self.markov.predict(sizes, ['B','S'])
@@ -535,6 +611,7 @@ class ProphetUltra:
             'pattern':   self.pattern.predict(sizes, ['B','S']),
             'streak':    self.streak.predict(sizes, ['B','S']),
             'frequency': self.freq_rev.predict(sizes, ['B','S']),
+            'ml':        self.ml_seq.predict(sizes),
         }
         
         # ─── COLOR SIGNALS ───
@@ -770,7 +847,7 @@ class ProphetServer:
             accs = self.pred_engine.consensus.accuracies()
             ws   = self.pred_engine.consensus.weights
             
-            for eng in ['markov','regime','pattern','streak','frequency']:
+            for eng in ['markov','regime','pattern','streak','frequency','ml']:
                 sz_s = pred.get('sz_signals',{}).get(eng,{})
                 cl_s = pred.get('cl_signals',{}).get(eng,{})
                 sz_p = sz_s.get('best','─')
@@ -854,6 +931,7 @@ class ProphetServer:
 ║    EmpiricalPattern   Pattern length 2-5, minimum 4 observations            ║
 ║    StreakBreakDetect  Streak continuation/break with empirical probabilities ║
 ║    FrequencyReversion Short vs long-term deficit detection (mean reversion)  ║
+║    MLSequenceModel    Logistic Regression on lag+streak+alternation features ║
 ║                                                                              ║
 ║  Consensus: Dynamic weighted voting, auto-adapts to live accuracy           ║
 ║  Number: Markov + gap analysis with size constraint                         ║
